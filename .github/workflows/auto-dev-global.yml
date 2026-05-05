@@ -1,0 +1,156 @@
+name: Auto Dev Global Agent
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # polls every 10 minutes
+  workflow_dispatch:           # manual trigger from Actions tab
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55       # stay under the 60-min Actions limit
+
+    steps:
+      - name: Checkout orchestrator repo (for system prompt)
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Process pending issues across all repos
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          ANTHROPIC_API_KEY: ${{ secrets.AI_AGENT_API_KEY }}
+          GH_USERNAME: ${{ secrets.GH_USERNAME }}
+        run: |
+          SYSTEM_PROMPT=$(cat .github/prompts/auto-dev-system.md)
+
+          # Find all open issues with 'auto-dev' label, not yet being processed
+          ISSUES=$(gh api \
+            "search/issues?q=is:issue+is:open+label:auto-dev+-label:implementing+-label:implemented+user:${GH_USERNAME}&per_page=20" \
+            --jq '.items | map({number: .number, title: .title, body: .body, repo: .repository_url}) | .[]' \
+            -X GET)
+
+          if [ -z "$ISSUES" ]; then
+            echo "No pending issues found."
+            exit 0
+          fi
+
+          echo "$ISSUES" | jq -c '.' | while read -r ISSUE; do
+            NUMBER=$(echo "$ISSUE" | jq -r '.number')
+            TITLE=$(echo "$ISSUE" | jq -r '.title')
+            BODY=$(echo "$ISSUE" | jq -r '.body // ""')
+            # repository_url format: https://api.github.com/repos/owner/repo
+            REPO_FULL=$(echo "$ISSUE" | jq -r '.repo' | sed 's|https://api.github.com/repos/||')
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "Issue #$NUMBER — $REPO_FULL — $TITLE"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            # Mark as processing to prevent duplicate runs
+            gh issue edit "$NUMBER" --repo "$REPO_FULL" --add-label "implementing" 2>/dev/null || true
+
+            WORK_DIR="work-${NUMBER}"
+
+            # --- per-issue error handling ---
+            (
+              set -e
+
+              # Clone target repo on preprod branch
+              git clone \
+                "https://x-access-token:${GH_TOKEN}@github.com/${REPO_FULL}.git" \
+                "$WORK_DIR"
+              cd "$WORK_DIR"
+
+              # Ensure preprod exists
+              git checkout preprod 2>/dev/null || {
+                git checkout -b preprod
+                git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO_FULL}.git" preprod
+              }
+
+              # Create feature branch off preprod
+              SLUG=$(echo "$TITLE" \
+                | tr '[:upper:]' '[:lower:]' \
+                | tr ' ' '-' \
+                | tr -dc '[:alnum:]-' \
+                | cut -c1-50)
+              BRANCH="auto/issue-${NUMBER}-${SLUG}"
+              git checkout -b "$BRANCH"
+
+              # Build prompt and run Claude
+              PROMPT="${SYSTEM_PROMPT}
+
+---
+
+## Issue #${NUMBER} — ${TITLE}
+
+${BODY}"
+
+              claude --dangerously-skip-permissions -p "$PROMPT"
+
+              # Commit
+              git config user.name "auto-dev-bot"
+              git config user.email "auto-dev-bot@users.noreply.github.com"
+              git add -A
+              if git diff --cached --quiet; then
+                echo "Claude made no file changes for issue #$NUMBER"
+                exit 1
+              fi
+              git commit -m "feat: implement issue #${NUMBER}
+
+${TITLE}
+
+Auto-implemented by auto-dev-agent.
+Issue: https://github.com/${REPO_FULL}/issues/${NUMBER}"
+
+              # Push feature branch
+              git push \
+                "https://x-access-token:${GH_TOKEN}@github.com/${REPO_FULL}.git" \
+                "$BRANCH"
+
+              # Merge into preprod
+              git checkout preprod
+              git merge --no-ff "$BRANCH" \
+                -m "merge: ${BRANCH} into preprod"
+              git push \
+                "https://x-access-token:${GH_TOKEN}@github.com/${REPO_FULL}.git" \
+                preprod
+
+            ) && STATUS="success" || STATUS="failure"
+
+            # Cleanup
+            rm -rf "$WORK_DIR"
+
+            # Comment and update labels based on outcome
+            if [ "$STATUS" = "success" ]; then
+              gh issue comment "$NUMBER" --repo "$REPO_FULL" --body \
+                "**Auto Dev Agent** — implementation complete
+
+Branch: \`auto/issue-${NUMBER}\`
+Merged into: \`preprod\`
+
+Review the changes before merging to \`main\`."
+
+              gh issue edit "$NUMBER" --repo "$REPO_FULL" \
+                --add-label "implemented" \
+                --remove-label "auto-dev" \
+                --remove-label "implementing" 2>/dev/null || true
+            else
+              RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              gh issue comment "$NUMBER" --repo "$REPO_FULL" --body \
+                "**Auto Dev Agent** — implementation failed
+
+[See logs](${RUN_URL})
+
+Remove and re-add the \`auto-dev\` label to retry."
+
+              gh issue edit "$NUMBER" --repo "$REPO_FULL" \
+                --remove-label "implementing" 2>/dev/null || true
+            fi
+
+          done

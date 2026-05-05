@@ -1,0 +1,32 @@
+name: Feature (auto-dev)
+description: Feature to be implemented automatically by the auto-dev agent
+title: "[feat] "
+labels: ["auto-dev"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue will be picked up automatically by the auto-dev agent.
+        Be precise — the agent implements exactly what is described.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What to implement
+      description: Describe the feature clearly. Include file paths, function names, or examples if relevant.
+      placeholder: |
+        Add a `getUserById(id)` function in `src/services/users.ts` that fetches a user from the database by ID and returns null if not found.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How do you know the feature is done?
+      placeholder: |
+        - [ ] Function exists and is exported
+        - [ ] Returns null when user not found
+        - [ ] Unit test covers both cases
+    validations:
+      required: false
